@@ -70,7 +70,7 @@ def test_stealing_detection(video_path: str, max_frames: int = 500):
                 tracker="botsort.yaml",
                 persist=True,
                 classes=[0],
-                conf=0.4,
+                conf=0.25,    # Lower threshold to detect small/crouched persons
                 verbose=False
             )
             
@@ -79,12 +79,12 @@ def test_stealing_detection(video_path: str, max_frames: int = 500):
                 track_ids = results[0].boxes.id.cpu().numpy().astype(int)
                 confidences = results[0].boxes.conf.cpu().numpy()
                 
-                # Initialize shelf detector for this frame
+                # Initialize shelf detector once (ShelfZoneDetector = AdaptiveZoneDetector)
                 from stealing_detection_system import ShelfZoneDetector
                 shelf_detector = ShelfZoneDetector(width, height)
                 
                 for box, track_id, conf in zip(boxes, track_ids, confidences):
-                    if conf < 0.4:
+                    if conf < 0.25:
                         continue
                     
                     # Get person's hands
@@ -106,9 +106,17 @@ def test_stealing_detection(video_path: str, max_frames: int = 500):
                     if is_anomaly:
                         behavioral_anomalies += 1
                     
+                    # Get global_id from ReID if enabled
+                    global_id = None
+                    if detector.enable_reid and detector.reid_tracker:
+                        timestamp = frame_idx / fps
+                        global_id = detector.reid_tracker.update_global_tracking(
+                            detector.camera_id, track_id, frame, box.tolist(), conf, timestamp
+                        )
+                    
                     # Test comprehensive stealing analysis
                     analysis = detector.analyze_stealing_behavior(
-                        track_id, box.tolist(), person_hands,
+                        track_id, global_id, box.tolist(), person_hands,
                         shelf_interaction, frame_idx, fps
                     )
                     

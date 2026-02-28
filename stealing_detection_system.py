@@ -190,6 +190,15 @@ class AdaptiveZoneDetector:
         
         return interactions
 
+
+class ShelfZoneDetector(AdaptiveZoneDetector):
+    """Alias for AdaptiveZoneDetector with shelf-specific interface for test compatibility."""
+    
+    def detect_hand_shelf_interaction(self, hands: List[Dict], person_bbox: List[float]) -> Dict:
+        """Alias for detect_hand_interaction - same interface for shelf interaction detection."""
+        return self.detect_hand_interaction(hands, person_bbox)
+
+
 class StealingDetectionSystem:
     """Multi-level stealing detection system with ReID integration"""
     
@@ -201,7 +210,7 @@ class StealingDetectionSystem:
         self.camera_id = camera_id
         
         # Load existing components
-        self.yolo_model = YOLO("yolov8n.pt")
+        self.yolo_model = YOLO("yolov8s.pt")  # 's' model for better small-object detection
         self.anomaly_detector = AnomalyDetector(model_path)
         
         try:
@@ -512,7 +521,7 @@ class StealingDetectionSystem:
                     confidences = results[0].boxes.conf.cpu().numpy()
                     
                     for box, track_id, conf in zip(boxes, track_ids, confidences):
-                        if conf < 0.4:
+                        if conf < 0.25:
                             continue
                         
                         # ReID processing
@@ -676,7 +685,7 @@ class StealingDetectionSystem:
         if self.enable_reid and self.reid_tracker:
             final_reid_stats = self.reid_tracker.get_tracking_statistics()
             # Save ReID data
-            self.reid_tracker.save_reid_data()
+            self.reid_tracker.save_reid_data(f"reid_data_{self.camera_id}.pkl")
         
         # Print comprehensive results
         print(f"\n=== Enhanced Stealing Detection with ReID Results ===")

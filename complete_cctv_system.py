@@ -10,6 +10,7 @@ from ultralytics import YOLO
 from vae_anomaly_detector import AnomalyDetector
 from person_reid_system import GlobalPersonTracker
 from adaptive_zone_learning import ActivityZoneLearner
+from pose_estimator import PoseEstimator
 import mediapipe as mp
 from typing import Dict, List, Tuple, Optional
 import time
@@ -27,7 +28,7 @@ class CompleteCCTVSystem:
         
         # Initialize core components
         print("📹 Loading YOLO person detection...")
-        self.yolo_model = YOLO("yolov8n.pt")
+        self.yolo_model = YOLO("yolov8s.pt")  # 's' model for better small-object detection
         
         print("🧠 Loading VAE anomaly detector...")
         self.anomaly_detector = AnomalyDetector(model_path)
@@ -43,6 +44,9 @@ class CompleteCCTVSystem:
         
         print("🤚 Initializing hand detection...")
         self.hand_detector = self._init_hand_detector()
+        
+        print("🦴 Initializing pose estimation...")
+        self.pose_estimator = PoseEstimator()
         
         print("🎯 Loading adaptive interaction zones...")
         self.zone_detector = None  # Will be initialized with video dimensions
@@ -151,6 +155,7 @@ class CompleteCCTVSystem:
     
     def analyze_person_behavior(self, global_id: int, local_track_id: int, 
                                person_bbox: List[float], person_hands: List[Dict],
+                               pose_data: Optional[Dict],
                                frame_idx: int, fps: int) -> Dict:
         """Comprehensive person behavior analysis"""
         
@@ -225,26 +230,43 @@ class CompleteCCTVSystem:
                 # Normalize speed (higher speed = higher score)
                 motion_score = min(avg_speed / 20.0, 1.0)  # Normalize to 0-1
         
-        # 4. COMBINED ANOMALY SCORE
-        # Weight different factors
+        # 4. POSE-BASED BEHAVIOR ANALYSIS
+        pose_score = 0.0
+        pose_behaviors = {}
+        if self.pose_estimator.available and pose_data is not None:
+            pose_features = self.pose_estimator.get_pose_features(pose_data)
+            pose_behaviors = pose_features
+            # Bending + arms extended near zone = picking (suspicious)
+            if pose_features['is_bending'] and pose_features['arms_extended'] and interaction_score > 0:
+                pose_score = 0.5
+            # Hands raised = potentially aggressive
+            elif pose_features['hands_raised']:
+                pose_score = 0.3
+            # Bending alone = could be picking
+            elif pose_features['is_bending']:
+                pose_score = 0.2
+        
+        # 5. COMBINED ANOMALY SCORE
+        # Weight different factors (pose adds to suspicion)
         combined_score = (
-            0.6 * anomaly_score +      # VAE anomaly (60%)
-            0.3 * interaction_score +  # Zone interactions (30%)
-            0.1 * motion_score         # Motion patterns (10%)
+            0.5 * anomaly_score +       # VAE anomaly (50%)
+            0.25 * interaction_score +  # Zone interactions (25%)
+            0.1 * motion_score +        # Motion patterns (10%)
+            0.15 * pose_score           # Pose-based (15%)
         )
         
-        # 5. TEMPORAL SMOOTHING
+        # 6. TEMPORAL SMOOTHING
         self.anomaly_histories[global_id].append(combined_score)
         if len(self.anomaly_histories[global_id]) > self.anomaly_window_size:
             self.anomaly_histories[global_id] = self.anomaly_histories[global_id][-self.anomaly_window_size:]
         
         # Calculate smoothed anomaly score
         if len(self.anomaly_histories[global_id]) >= self.min_track_length:
-            smoothed_score = np.mean(self.anomaly_histories[global_id])
+            smoothed_score = np.percentile(self.anomaly_histories[global_id],70)
         else:
             smoothed_score = 0.0  # Not enough data yet
         
-        # 6. DETERMINE BEHAVIOR CATEGORY
+        # 7. DETERMINE BEHAVIOR CATEGORY
         if smoothed_score >= self.anomaly_thresholds['anomaly']:
             behavior_category = 'anomaly'
             behavior_text = 'ANOMALY'
@@ -255,7 +277,7 @@ class CompleteCCTVSystem:
             behavior_category = 'normal'
             behavior_text = 'NORMAL'
         
-        # 7. ADDITIONAL BEHAVIOR DETAILS
+        # 8. ADDITIONAL BEHAVIOR DETAILS
         duration = timestamp - person_info['first_seen']
         is_loitering = duration > 10.0 and len(person_info['cameras_seen']) == 1
         has_interactions = len(person_info['interactions']) > 0
@@ -277,95 +299,84 @@ class CompleteCCTVSystem:
                 'is_multi_camera': is_multi_camera,
                 'motion_score': motion_score,
                 'interaction_score': interaction_score,
-                'vae_score': anomaly_score
+                'vae_score': anomaly_score,
+                'pose_score': pose_score,
+                'pose_behaviors': pose_behaviors
             }
         }
     
     def draw_person_visualization(self, frame: np.ndarray, person_bbox: np.ndarray, 
                                 analysis: Dict, person_hands: List[Dict]) -> np.ndarray:
         """Draw comprehensive person visualization"""
-        
         x1, y1, x2, y2 = person_bbox.astype(int)
         global_id = analysis['global_id']
-        local_id = analysis['local_track_id']
-        
+        anomaly_score = analysis['anomaly_score']
+
         # Choose color based on behavior category
         color = self.colors[analysis['behavior_category']]
-        
-        # Draw main bounding box with thick border
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 4)
-        
-        # Create comprehensive label
-        behavior_text = analysis['behavior_text']
-        anomaly_score = analysis['anomaly_score']
-        duration = analysis['duration']
-        cameras = analysis['cameras_seen']
-        
-        # Main label with global and local IDs
-        main_label = f"G:{global_id} L:{local_id} {behavior_text}"
-        if anomaly_score > 0:
-            main_label += f" ({anomaly_score:.2f})"
-        
-        # Additional info label
-        info_label = f"{duration:.1f}s"
-        if cameras > 1:
-            info_label += f" | {cameras} cams"
-        if analysis['details']['has_interactions']:
-            info_label += " | INT"
-        
-        # Draw main label background and text
-        main_label_size = cv2.getTextSize(main_label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-        cv2.rectangle(frame, 
-                     (x1, y1 - main_label_size[1] - 15), 
-                     (x1 + main_label_size[0] + 10, y1), 
-                     color, -1)
-        cv2.putText(frame, main_label, (x1 + 5, y1 - 5), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        # Draw info label
-        info_label_size = cv2.getTextSize(info_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-        cv2.rectangle(frame, 
-                     (x1, y2), 
-                     (x1 + info_label_size[0] + 10, y2 + info_label_size[1] + 10), 
-                     color, -1)
-        cv2.putText(frame, info_label, (x1 + 5, y2 + info_label_size[1] + 5), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        # Draw anomaly score bar
-        if anomaly_score > 0:
-            bar_width = 100
-            bar_height = 8
-            bar_x = x1
-            bar_y = y1 - main_label_size[1] - 25
-            
-            # Background bar
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
-            
-            # Score bar
-            score_width = int(bar_width * min(anomaly_score, 1.0))
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + score_width, bar_y + bar_height), color, -1)
-            
-            # Score text
-            cv2.putText(frame, f"{anomaly_score:.2f}", (bar_x + bar_width + 5, bar_y + bar_height), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        
-        # Draw hands if present
-        for hand in person_hands:
-            hx1, hy1, hx2, hy2 = hand['bbox']
-            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (255, 0, 255), 2)
-            cv2.putText(frame, f"Hand-{hand['handedness']}", (hx1, hy1-5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-        
-        # Draw trajectory for anomalous persons
-        if analysis['behavior_category'] != 'normal' and global_id in self.person_data:
-            positions = self.person_data[global_id]['positions']
-            if len(positions) > 2:
-                # Draw trajectory line
-                trajectory_points = [(int(p[0]), int(p[1])) for p in positions[-20:]]  # Last 20 positions
-                for i in range(1, len(trajectory_points)):
-                    cv2.line(frame, trajectory_points[i-1], trajectory_points[i], color, 2)
-        
+
+        # Draw bounding box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        # Small label: ID + anomaly score
+        label = f"ID:{global_id} {anomaly_score:.2f}"
+
+        cv2.putText(frame, label,
+                    (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2)
+
         return frame
+    
+    def create_dashboard(self, frame_idx, total_frames, active_persons, anomaly_counts, fps_current):
+        """Create separate dashboard window"""
+
+        dashboard = np.zeros((400, 600, 3), dtype=np.uint8)
+
+        y = 40
+        gap = 35
+
+        cv2.putText(dashboard, "CCTV SYSTEM DASHBOARD",
+                    (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+        y += gap
+
+        cv2.putText(dashboard, f"Frame: {frame_idx}/{total_frames}",
+                    (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        y += gap
+
+        cv2.putText(dashboard, f"Active Persons: {active_persons}",
+                    (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        y += gap
+
+        cv2.putText(dashboard, f"Normal: {anomaly_counts['normal']}",
+                    (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        y += gap
+
+        cv2.putText(dashboard, f"Suspicious: {anomaly_counts['suspicious']}",
+                    (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,165,255), 2)
+        y += gap
+
+        cv2.putText(dashboard, f"Anomalies: {anomaly_counts['anomaly']}",
+                    (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+        y += gap
+
+        # ReID statistics
+        reid_stats = self.reid_tracker.get_tracking_statistics()
+
+        cv2.putText(dashboard, f"Global Persons: {reid_stats['total_global_persons']}",
+                    (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+        y += gap
+
+        cv2.putText(dashboard, f"ReID Matches: {reid_stats['reid_matches']}",
+                    (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+        y += gap
+
+        cv2.putText(dashboard, f"FPS: {fps_current:.2f}",
+                    (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+        return dashboard
     
     def draw_system_info(self, frame: np.ndarray, frame_idx: int, total_frames: int, 
                         active_persons: int, anomaly_counts: Dict) -> np.ndarray:
@@ -502,10 +513,11 @@ class CompleteCCTVSystem:
                 # Person detection and tracking
                 results = self.yolo_model.track(
                     source=frame,
-                    tracker="botsort.yaml",
+                    tracker="botsort_improved.yaml",
                     persist=True,
                     classes=[0],  # person only
-                    conf=0.4,
+                    conf=0.25,    # Lower threshold to detect small/crouched persons
+                    imgsz=640,    # Higher resolution for small objects
                     verbose=False
                 )
                 
@@ -516,7 +528,7 @@ class CompleteCCTVSystem:
                 annotated_frame = frame.copy()
                 
                 # Draw interaction zones
-                annotated_frame = self.draw_interaction_zones(annotated_frame)
+               # annotated_frame = self.draw_interaction_zones(annotated_frame)
                 
                 # Process person detections
                 anomaly_counts = {'normal': 0, 'suspicious': 0, 'anomaly': 0}
@@ -528,7 +540,7 @@ class CompleteCCTVSystem:
                     confidences = results[0].boxes.conf.cpu().numpy()
                     
                     for box, track_id, conf in zip(boxes, track_ids, confidences):
-                        if conf < 0.4:
+                        if conf < 0.25:
                             continue
                         
                         active_persons += 1
@@ -541,23 +553,30 @@ class CompleteCCTVSystem:
                         # Get person's hands
                         person_hands = self.get_person_hands(box, hands)
                         
+                        # Detect pose for this person (crop to bbox for accuracy)
+                        pose_data = None
+                        if self.pose_estimator.available:
+                            pose_data = self.pose_estimator.detect_pose(frame, box.tolist())
+                        
                         # Analyze person behavior
                         analysis = self.analyze_person_behavior(
-                            global_id, track_id, box.tolist(), person_hands, frame_idx, fps
+                            global_id, track_id, box.tolist(), person_hands, pose_data, frame_idx, fps
                         )
                         
                         # Count anomaly categories
                         anomaly_counts[analysis['behavior_category']] += 1
                         
+                        # Draw pose skeleton (optional, for debugging)
+                        if pose_data and self.pose_estimator.available:
+                            color = self.colors[analysis['behavior_category']]
+                            annotated_frame = self.pose_estimator.draw_pose(
+                                annotated_frame, pose_data, color
+                            )
+                        
                         # Draw person visualization
                         annotated_frame = self.draw_person_visualization(
                             annotated_frame, box, analysis, person_hands
                         )
-                
-                # Draw system information
-                annotated_frame = self.draw_system_info(
-                    annotated_frame, frame_idx, total_frames, active_persons, anomaly_counts
-                )
                 
                 # Write frame
                 if writer:
@@ -565,7 +584,20 @@ class CompleteCCTVSystem:
                 
                 # Display frame
                 if display:
-                    cv2.imshow('Complete CCTV System - Global ReID + Anomaly Detection', annotated_frame)
+                    elapsed = time.time() - start_time
+                    fps_current = frame_idx / elapsed if elapsed > 0 else 0
+
+                    dashboard_frame = self.create_dashboard(
+                        frame_idx,
+                        total_frames,
+                        active_persons,
+                        anomaly_counts,
+                        fps_current
+                    )
+
+                    cv2.imshow('CCTV Video', annotated_frame)
+                    cv2.imshow('CCTV Dashboard', dashboard_frame)
+
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q'):
                         print("\n⏹️  Processing stopped by user")

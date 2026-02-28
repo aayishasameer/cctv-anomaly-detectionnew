@@ -15,7 +15,16 @@ data/
 
 # YOLO outputs
 runs/
-*.pt
+yolov8*.pt
+
+# Generated data
+*.pkl
+
+# Trained models (large)
+models/*.pth
+
+# Backup/legacy
+noneed/
 
 # OS files
 .DS_Store

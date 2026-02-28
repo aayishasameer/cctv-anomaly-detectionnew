@@ -19,7 +19,7 @@ class ActivityZoneLearner:
     """Learn interaction zones from normal behavior videos"""
     
     def __init__(self):
-        self.yolo_model = YOLO("yolov8n.pt")
+        self.yolo_model = YOLO("yolov8s.pt")  # 's' model for better small-object detection
         
         # Zone learning parameters
         self.low_speed_threshold = 2.0  # pixels per frame
@@ -61,7 +61,8 @@ class ActivityZoneLearner:
                     tracker="botsort.yaml",
                     persist=True,
                     classes=[0],  # person only
-                    conf=0.4,
+                    conf=0.25,    # Lower threshold to detect small/crouched persons
+                    imgsz=640,
                     verbose=False
                 )
                 

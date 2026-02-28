@@ -14,7 +14,7 @@ appearance_thresh: 0.7          # Stricter appearance matching (was 0.5)
 fuse_score: True
 
 # Enable ReID for better identity consistency
-with_reid: True                 # Enable ReID (was False)
+with_reid: False                 # Enable ReID (was False)
 reid_weights: "osnet_x0_25_msmt17.pt"
 model: "auto"
 

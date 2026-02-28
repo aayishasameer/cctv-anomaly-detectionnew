@@ -20,7 +20,7 @@ class ImprovedAnomalyTracker:
         print("Initializing Improved Anomaly Tracker...")
         
         # Load YOLO model with higher confidence
-        self.yolo_model = YOLO("yolov8n.pt")
+        self.yolo_model = YOLO("yolov8s.pt")  # 's' model for better small-object detection
         
         # Load anomaly detector
         self.anomaly_detector = AnomalyDetector(model_path)
@@ -44,7 +44,7 @@ class ImprovedAnomalyTracker:
         self.anomaly_threshold_frames = 8   # REDUCED: Faster anomaly confirmation
         self.anomaly_confirmation_ratio = 0.6  # REDUCED: 60% confirmation (was 75%)
         self.min_track_length = 12          # REDUCED: Much faster response (was 25)
-        self.confidence_threshold = 0.4     # REDUCED: Lower threshold for better detection
+        self.confidence_threshold = 0.25    # Lower threshold to detect small/crouched persons
         
         # Context-aware detection parameters
         self.zone_sensitivity = {
@@ -243,10 +243,11 @@ class ImprovedAnomalyTracker:
                 # Run tracking with improved config
                 results = self.yolo_model.track(
                     source=frame,
-                    tracker="botsort_improved.yaml",  # Use improved config
+                    tracker="botsort_improved.yaml",
                     persist=True,
                     classes=[0],  # person only
-                    conf=self.confidence_threshold,  # Higher confidence
+                    conf=self.confidence_threshold,
+                    imgsz=640,    # Higher resolution for small objects
                     verbose=False
                 )
                 

@@ -16,111 +16,69 @@ from typing import Dict, List, Tuple, Optional
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
 import time
+import torchreid
 
-class PersonReIDModel(nn.Module):
-    """Person Re-Identification model based on ResNet50"""
-    
-    def __init__(self, num_features: int = 2048, dropout: float = 0.5):
-        super(PersonReIDModel, self).__init__()
-        
-        # Use ResNet50 as backbone
-        self.backbone = resnet50(pretrained=True)
-        
-        # Remove the final classification layer
-        self.backbone.fc = nn.Identity()
-        
-        # Add ReID-specific layers
-        self.feature_dim = num_features
-        self.dropout = nn.Dropout(dropout)
-        
-        # Feature projection layer
-        self.feature_proj = nn.Sequential(
-            nn.Linear(2048, self.feature_dim),
-            nn.BatchNorm1d(self.feature_dim),
-            nn.ReLU(inplace=True),
-            self.dropout
-        )
-        
-        # L2 normalization for feature vectors
-        self.l2_norm = nn.functional.normalize
-        
-    def forward(self, x):
-        # Extract features using ResNet backbone
-        features = self.backbone(x)
-        
-        # Project to ReID feature space
-        reid_features = self.feature_proj(features)
-        
-        # L2 normalize features
-        reid_features = self.l2_norm(reid_features, p=2, dim=1)
-        
-        return reid_features
 
 class PersonReIDExtractor:
-    """Extract ReID features from person crops"""
-    
-    def __init__(self, model_path: str = "models/person_reid_model.pth", device: str = "auto"):
-        self.device = torch.device("cuda" if torch.cuda.is_available() and device == "auto" else "cpu")
-        
-        # Initialize model
-        self.model = PersonReIDModel()
-        
-        # Load pre-trained weights if available
-        if os.path.exists(model_path):
-            try:
-                checkpoint = torch.load(model_path, map_location=self.device)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"✅ Loaded ReID model from {model_path}")
-            except Exception as e:
-                print(f"⚠️  Could not load ReID model: {e}")
-                print("Using pre-trained ResNet50 features")
-        else:
-            print("⚠️  ReID model not found, using pre-trained ResNet50 features")
-        
+    """Professional Person ReID feature extractor using OSNet"""
+
+    def __init__(self, device="auto"):
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() and device == "auto" else "cpu"
+        )
+
+        print("🔄 Loading OSNet ReID model...")
+
+        # Build OSNet model pretrained on Market1501
+        self.model = torchreid.models.build_model(
+            name='osnet_x1_0',
+            num_classes=1000,
+            pretrained=True
+        )
+
         self.model.to(self.device)
         self.model.eval()
-        
-        # Image preprocessing
+
+        print("✅ OSNet ReID model loaded successfully")
+
+        # Preprocessing (OSNet standard)
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((256, 128)),  # Standard ReID input size
+            transforms.Resize((256, 128)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
         ])
-    
+
     def extract_features(self, person_crop: np.ndarray) -> np.ndarray:
-        """Extract ReID features from person crop"""
-        
         if person_crop is None or person_crop.size == 0:
-            return np.zeros(2048, dtype=np.float32)
-        
+            return np.zeros(512, dtype=np.float32)
+
         try:
-            # Preprocess image
-            if len(person_crop.shape) == 3:
-                # Convert BGR to RGB
-                person_crop = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
-            
-            # Apply transforms
+            # Convert BGR → RGB
+            person_crop = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
+
             input_tensor = self.transform(person_crop).unsqueeze(0).to(self.device)
-            
-            # Extract features
+
             with torch.no_grad():
                 features = self.model(input_tensor)
+                features = torch.nn.functional.normalize(features, p=2, dim=1)
                 features = features.cpu().numpy().flatten()
-            
+
             return features.astype(np.float32)
-            
+
         except Exception as e:
-            print(f"⚠️  Error extracting ReID features: {e}")
-            return np.zeros(2048, dtype=np.float32)
+            print(f"⚠️ ReID extraction error: {e}")
+            return np.zeros(512, dtype=np.float32)
 
 class GlobalPersonTracker:
     """Global person tracker with ReID for multi-camera scenarios"""
     
     def __init__(self, reid_model_path: str = "models/person_reid_model.pth"):
         # Initialize ReID feature extractor
-        self.reid_extractor = PersonReIDExtractor(reid_model_path)
+        self.reid_extractor = PersonReIDExtractor(device="auto")
         
         # Global tracking data
         self.global_persons = {}  # global_id -> person_data
@@ -128,7 +86,7 @@ class GlobalPersonTracker:
         self.next_global_id = 1
         
         # ReID parameters - More conservative to prevent false matches
-        self.similarity_threshold = 0.85  # Higher threshold to prevent false matches
+        self.similarity_threshold = 0.75  # Higher threshold to prevent false matches
         self.max_time_gap = 30.0  # Maximum time gap for re-identification (seconds)
         self.min_feature_quality = 0.6  # Higher quality threshold
         self.strict_matching = True  # Enable strict matching mode
@@ -439,7 +397,7 @@ class GlobalPersonTracker:
             similarities = cosine_similarity([query_features], gallery_features)[0]
             
             # Require consistent high similarity with multiple features
-            high_sim_count = np.sum(similarities > 0.8)
+            high_sim_count = np.sum(similarities > 0.75)
             if high_sim_count < len(similarities) * 0.6:  # At least 60% high similarity
                 return False
         
