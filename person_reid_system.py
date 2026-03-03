@@ -407,6 +407,17 @@ class GlobalPersonTracker:
         """Get global ID for a local track"""
         return self.camera_tracks[camera_id].get(local_track_id)
     
+    def get_last_known_id(self, camera_id: str, local_track_id: int) -> int:
+        """Get last known global ID for a local track, or create new if not found"""
+        if local_track_id in self.camera_tracks[camera_id]:
+            return self.camera_tracks[camera_id][local_track_id]
+        else:
+            # Create new global ID if not found
+            global_id = self.next_global_id
+            self.next_global_id += 1
+            self.camera_tracks[camera_id][local_track_id] = global_id
+            return global_id
+    
     def get_person_info(self, global_id: int) -> Dict:
         """Get information about a global person"""
         return self.global_persons.get(global_id, {})

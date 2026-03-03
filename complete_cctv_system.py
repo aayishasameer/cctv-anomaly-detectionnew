@@ -9,7 +9,6 @@ import numpy as np
 from ultralytics import YOLO
 from vae_anomaly_detector import AnomalyDetector
 from person_reid_system import GlobalPersonTracker
-from adaptive_zone_learning import ActivityZoneLearner
 from pose_estimator import PoseEstimator
 import mediapipe as mp
 from typing import Dict, List, Tuple, Optional
@@ -48,9 +47,6 @@ class CompleteCCTVSystem:
         print("🦴 Initializing pose estimation...")
         self.pose_estimator = PoseEstimator()
         
-        print("🎯 Loading adaptive interaction zones...")
-        self.zone_detector = None  # Will be initialized with video dimensions
-        
         # Tracking and anomaly data
         self.person_data = {}  # global_id -> comprehensive person data
         self.anomaly_histories = {}  # global_id -> anomaly history
@@ -87,17 +83,6 @@ class CompleteCCTVSystem:
         except AttributeError:
             print("⚠️  MediaPipe hand detection not available, using fallback")
             return None
-    
-    def _init_zone_detector(self, width: int, height: int):
-        """Initialize adaptive zone detector with video dimensions"""
-        try:
-            from stealing_detection_system import AdaptiveZoneDetector
-            self.zone_detector = AdaptiveZoneDetector(width, height)
-            print(f"🎯 Loaded {len(self.zone_detector.interaction_zones)} learned interaction zones")
-        except Exception as e:
-            print(f"⚠️  Zone detector not available: {e}")
-            print("🎯 Using fallback mode without interaction zones")
-            self.zone_detector = None
     
     def detect_hands(self, frame: np.ndarray) -> List[Dict]:
         """Detect hands in frame"""
@@ -203,19 +188,7 @@ class CompleteCCTVSystem:
         if len(person_info['anomaly_scores']) > 50:
             person_info['anomaly_scores'] = person_info['anomaly_scores'][-50:]
         
-        # 2. INTERACTION ANALYSIS
-        interaction_score = 0.0
-        if self.zone_detector and person_hands:
-            zone_interactions = self.zone_detector.detect_hand_interaction(
-                person_hands, person_bbox
-            )
-            if zone_interactions['has_interaction']:
-                interaction_score = zone_interactions['interaction_score']
-                person_info['interactions'].append({
-                    'timestamp': timestamp,
-                    'score': interaction_score,
-                    'zones': zone_interactions['interaction_zones']
-                })
+        # 2. INTERACTION ANALYSIS (removed - no zone learning)
         
         # 3. MOTION ANALYSIS
         motion_score = 0.0
@@ -236,8 +209,8 @@ class CompleteCCTVSystem:
         if self.pose_estimator.available and pose_data is not None:
             pose_features = self.pose_estimator.get_pose_features(pose_data)
             pose_behaviors = pose_features
-            # Bending + arms extended near zone = picking (suspicious)
-            if pose_features['is_bending'] and pose_features['arms_extended'] and interaction_score > 0:
+            # Bending + arms extended = picking (suspicious)
+            if pose_features['is_bending'] and pose_features['arms_extended']:
                 pose_score = 0.5
             # Hands raised = potentially aggressive
             elif pose_features['hands_raised']:
@@ -249,10 +222,9 @@ class CompleteCCTVSystem:
         # 5. COMBINED ANOMALY SCORE
         # Weight different factors (pose adds to suspicion)
         combined_score = (
-            0.5 * anomaly_score +       # VAE anomaly (50%)
-            0.25 * interaction_score +  # Zone interactions (25%)
-            0.1 * motion_score +        # Motion patterns (10%)
-            0.15 * pose_score           # Pose-based (15%)
+            0.6 * anomaly_score +       # VAE anomaly (60%)
+            0.25 * pose_score +         # Pose-based (25%)
+            0.15 * motion_score         # Motion patterns (15%)
         )
         
         # 6. TEMPORAL SMOOTHING
@@ -280,8 +252,19 @@ class CompleteCCTVSystem:
         # 8. ADDITIONAL BEHAVIOR DETAILS
         duration = timestamp - person_info['first_seen']
         is_loitering = duration > 10.0 and len(person_info['cameras_seen']) == 1
-        has_interactions = len(person_info['interactions']) > 0
         is_multi_camera = len(person_info['cameras_seen']) > 1
+        
+        # 9. EXPLICIT STEALING DETECTION
+        is_stealing = (
+            pose_score > 0.4 and
+            anomaly_score > 0.6 and
+            motion_score < 0.2
+        )
+        
+        # Override behavior if stealing detected
+        if is_stealing:
+            behavior_category = 'anomaly'
+            behavior_text = 'STEALING'
         
         return {
             'global_id': global_id,
@@ -295,10 +278,9 @@ class CompleteCCTVSystem:
             'total_detections': person_info['total_detections'],
             'details': {
                 'is_loitering': is_loitering,
-                'has_interactions': has_interactions,
                 'is_multi_camera': is_multi_camera,
+                'is_stealing': is_stealing,
                 'motion_score': motion_score,
-                'interaction_score': interaction_score,
                 'vae_score': anomaly_score,
                 'pose_score': pose_score,
                 'pose_behaviors': pose_behaviors
@@ -443,33 +425,6 @@ class CompleteCCTVSystem:
         
         return frame
     
-    def draw_interaction_zones(self, frame: np.ndarray) -> np.ndarray:
-        """Draw learned interaction zones"""
-        
-        if not self.zone_detector:
-            return frame
-        
-        for zone in self.zone_detector.interaction_zones:
-            x1, y1, x2, y2 = [int(coord) for coord in zone['bbox']]
-            
-            # Color based on zone density
-            if zone['density'] > 0.4:
-                zone_color = (0, 255, 255)  # High activity - Yellow
-            elif zone['density'] > 0.2:
-                zone_color = (255, 255, 0)  # Medium activity - Cyan
-            else:
-                zone_color = (128, 128, 128)  # Low activity - Gray
-            
-            # Draw zone boundary
-            cv2.rectangle(frame, (x1, y1), (x2, y2), zone_color, 1)
-            
-            # Zone label
-            label = f"{zone['id']} (D:{zone['density']:.2f})"
-            cv2.putText(frame, label, (x1, y1-5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, zone_color, 1)
-        
-        return frame
-    
     def process_video(self, video_path: str, output_path: str = None, display: bool = True):
         """Process video with complete CCTV system"""
         
@@ -488,9 +443,6 @@ class CompleteCCTVSystem:
         print(f"📹 Camera ID: {self.camera_id}")
         print(f"🔍 ReID Enabled: Yes")
         print(f"🎯 Anomaly Visualization: 3-Color System")
-        
-        # Initialize zone detector with video dimensions
-        self._init_zone_detector(width, height)
         
         # Setup video writer
         writer = None
@@ -527,9 +479,6 @@ class CompleteCCTVSystem:
                 # Process frame
                 annotated_frame = frame.copy()
                 
-                # Draw interaction zones
-               # annotated_frame = self.draw_interaction_zones(annotated_frame)
-                
                 # Process person detections
                 anomaly_counts = {'normal': 0, 'suspicious': 0, 'anomaly': 0}
                 active_persons = 0
@@ -545,17 +494,20 @@ class CompleteCCTVSystem:
                         
                         active_persons += 1
                         
-                        # Global ReID processing
-                        global_id = self.reid_tracker.update_global_tracking(
-                            self.camera_id, track_id, frame, box.tolist(), conf, timestamp
-                        )
+                        # Global ReID processing (optimized - every 5 frames)
+                        if frame_idx % 5 == 0:
+                            global_id = self.reid_tracker.update_global_tracking(
+                                self.camera_id, track_id, frame, box.tolist(), conf, timestamp
+                            )
+                        else:
+                            global_id = self.reid_tracker.get_last_known_id(self.camera_id, track_id)
                         
                         # Get person's hands
                         person_hands = self.get_person_hands(box, hands)
                         
-                        # Detect pose for this person (crop to bbox for accuracy)
+                        # Detect pose for this person (optimized - every 3 frames)
                         pose_data = None
-                        if self.pose_estimator.available:
+                        if self.pose_estimator.available and frame_idx % 3 == 0:
                             pose_data = self.pose_estimator.detect_pose(frame, box.tolist())
                         
                         # Analyze person behavior
